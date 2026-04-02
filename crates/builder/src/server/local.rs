@@ -19,7 +19,6 @@ use std::{
 use alloy_primitives::{Address, B256};
 use async_trait::async_trait;
 use futures::future::BoxFuture;
-use futures_util::StreamExt;
 use metrics::Histogram;
 use metrics_derive::Metrics;
 use rundler_signer::SignerManager;
@@ -28,19 +27,22 @@ use rundler_task::{
     server::{HealthCheck, ServerStatus},
 };
 use rundler_types::{
-    builder::{Builder, BuilderError, BuilderResult, BundlingMode},
-    pool::Pool,
+    authorization::Eip7702Auth,
+    builder::{Builder, BuilderError, BuilderResult, BundlingMode, DelegationId, DelegationStatus},
+    pool::NewHead,
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot};
 
-use crate::bundle_sender::{BundleSenderAction, SendBundleRequest, SendBundleResult};
+use crate::{
+    bundle_sender::{BundleSenderAction, SendBundleRequest, SendBundleResult},
+    delegation_sender::DelegationSenderHandle,
+};
 
 /// Local builder server builder
 pub struct LocalBuilderBuilder {
     req_sender: mpsc::Sender<ServerRequest>,
     req_receiver: mpsc::Receiver<ServerRequest>,
     signer_manager: Arc<dyn SignerManager>,
-    pool: Arc<dyn Pool>,
 }
 
 #[derive(Metrics, Clone)]
@@ -52,17 +54,12 @@ struct LocalBuilderMetrics {
 
 impl LocalBuilderBuilder {
     /// Create a new local builder server builder
-    pub fn new(
-        request_capacity: usize,
-        signer_manager: Arc<dyn SignerManager>,
-        pool: Arc<dyn Pool>,
-    ) -> Self {
+    pub fn new(request_capacity: usize, signer_manager: Arc<dyn SignerManager>) -> Self {
         let (req_sender, req_receiver) = mpsc::channel(request_capacity);
         Self {
             req_sender,
             req_receiver,
             signer_manager,
-            pool,
         }
     }
 
@@ -74,20 +71,29 @@ impl LocalBuilderBuilder {
         }
     }
 
-    /// Run the local builder server, consuming the builder
+    /// Run the local builder server, consuming the builder.
+    ///
+    /// `heads_rx` is a receiver for the shared new-heads broadcast; used to
+    /// keep signer balances up to date.
+    ///
+    /// `delegation_handle` is the handle to the long-running delegation sender
+    /// task that owns delegation state and does the actual send/wait work.
     pub fn run(
         self,
         bundle_sender_actions: Vec<mpsc::Sender<BundleSenderAction>>,
         entry_points: Vec<Address>,
+        heads_rx: broadcast::Receiver<Arc<NewHead>>,
+        delegation_handle: DelegationSenderHandle,
         shutdown: GracefulShutdown,
     ) -> BoxFuture<'static, ()> {
-        let runner = LocalBuilderServerRunner::new(
-            self.req_receiver,
+        let runner = LocalBuilderServerRunner {
+            req_receiver: self.req_receiver,
             bundle_sender_actions,
             entry_points,
-            self.signer_manager,
-            self.pool,
-        );
+            signer_manager: self.signer_manager,
+            heads_rx,
+            delegation_handle,
+        };
         Box::pin(runner.run(shutdown))
     }
 }
@@ -104,7 +110,8 @@ struct LocalBuilderServerRunner {
     bundle_sender_actions: Vec<mpsc::Sender<BundleSenderAction>>,
     entry_points: Vec<Address>,
     signer_manager: Arc<dyn SignerManager>,
-    pool: Arc<dyn Pool>,
+    heads_rx: broadcast::Receiver<Arc<NewHead>>,
+    delegation_handle: DelegationSenderHandle,
 }
 
 impl LocalBuilderHandle {
@@ -166,6 +173,24 @@ impl Builder for LocalBuilderHandle {
             _ => Err(BuilderError::UnexpectedResponse),
         }
     }
+
+    async fn send_sponsored_delegation(&self, auth: Eip7702Auth) -> BuilderResult<DelegationId> {
+        let req = ServerRequestKind::SendSponsoredDelegation { auth };
+        let resp = self.send(req).await?;
+        match resp {
+            ServerResponse::SendSponsoredDelegation { id } => Ok(id),
+            _ => Err(BuilderError::UnexpectedResponse),
+        }
+    }
+
+    async fn get_delegation_status(&self, id: DelegationId) -> BuilderResult<DelegationStatus> {
+        let req = ServerRequestKind::GetDelegationStatus { id };
+        let resp = self.send(req).await?;
+        match resp {
+            ServerResponse::GetDelegationStatus { status } => Ok(status),
+            _ => Err(BuilderError::UnexpectedResponse),
+        }
+    }
 }
 
 #[async_trait]
@@ -193,92 +218,118 @@ impl HealthCheck for LocalBuilderHandle {
 }
 
 impl LocalBuilderServerRunner {
-    fn new(
-        req_receiver: mpsc::Receiver<ServerRequest>,
-        bundle_sender_actions: Vec<mpsc::Sender<BundleSenderAction>>,
-        entry_points: Vec<Address>,
-        signer_manager: Arc<dyn SignerManager>,
-        pool: Arc<dyn Pool>,
-    ) -> Self {
-        Self {
-            req_receiver,
-            bundle_sender_actions,
-            entry_points,
-            signer_manager,
-            pool,
-        }
-    }
-
     async fn run(mut self, shutdown: GracefulShutdown) {
-        let Ok(mut new_heads) = self.pool.subscribe_new_heads(vec![]).await else {
-            tracing::error!("Failed to subscribe to new blocks");
-            panic!("failed to subscribe to new blocks");
-        };
-
         loop {
             tokio::select! {
                 _ = shutdown.clone() => {
                     return;
                 }
-                new_head = new_heads.next() => {
-                    let Some(new_head) = new_head else {
-                        tracing::error!("new head stream closed");
-                        panic!("new head stream closed");
-                    };
-                    if !new_head.address_updates.is_empty() {
-                        tracing::info!("received new head with address updates: {:?}", new_head);
-                        let balances = new_head.address_updates.iter().map(|update| (update.address, update.balance)).collect();
-                        self.signer_manager.update_balances(balances);
+                head = self.heads_rx.recv() => {
+                    match head {
+                        Ok(new_head) => {
+                            if !new_head.address_updates.is_empty() {
+                                tracing::info!("received new head with address updates: {:?}", new_head);
+                                let balances = new_head
+                                    .address_updates
+                                    .iter()
+                                    .map(|u| (u.address, u.balance))
+                                    .collect::<Vec<_>>();
+                                self.signer_manager.update_balances(balances);
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            tracing::warn!("local builder heads receiver lagged by {n} blocks");
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            tracing::error!("heads broadcast closed in local builder server");
+                            return;
+                        }
                     }
                 }
                 Some(req) = self.req_receiver.recv() => {
-                    let resp: BuilderResult<ServerResponse> = 'a:  {
-                        match req.request {
-                            ServerRequestKind::GetSupportedEntryPoints => {
-                                Ok(ServerResponse::GetSupportedEntryPoints {
-                                    entry_points: self.entry_points.clone()
-                                })
-                            },
-                            ServerRequestKind::DebugSendBundleNow => {
-                                if self.bundle_sender_actions.len() != 1 {
-                                    break 'a Err(anyhow::anyhow!("more than 1 bundle builder not supported in debug mode").into())
-                                }
+                    let resp: BuilderResult<ServerResponse> = match req.request {
+                        ServerRequestKind::SendSponsoredDelegation { auth } => {
+                            match self.delegation_handle.send_delegation(auth).await {
+                                Ok(id) => Ok(ServerResponse::SendSponsoredDelegation { id }),
+                                Err(e) => Err(e),
+                            }
+                        }
 
+                        ServerRequestKind::GetDelegationStatus { id } => {
+                            match self.delegation_handle.get_delegation_status(id).await {
+                                Ok(status) => Ok(ServerResponse::GetDelegationStatus { status }),
+                                Err(e) => Err(e),
+                            }
+                        }
+
+                        ServerRequestKind::GetSupportedEntryPoints => {
+                            Ok(ServerResponse::GetSupportedEntryPoints {
+                                entry_points: self.entry_points.clone(),
+                            })
+                        }
+
+                        ServerRequestKind::DebugSendBundleNow => {
+                            if self.bundle_sender_actions.len() != 1 {
+                                Err(anyhow::anyhow!(
+                                    "more than 1 bundle builder not supported in debug mode"
+                                )
+                                .into())
+                            } else {
                                 let (tx, rx) = oneshot::channel();
-                                match self.bundle_sender_actions[0].send(BundleSenderAction::SendBundle(SendBundleRequest{
-                                    responder: tx
-                                })).await {
-                                    Ok(()) => {},
-                                    Err(e) => break 'a Err(anyhow::anyhow!("failed to send send bundle request: {}", e.to_string()).into())
-                                }
-
-                                let result = match rx.await {
-                                    Ok(result) => result,
-                                    Err(e) => break 'a Err(anyhow::anyhow!("failed to receive bundle result: {e:?}").into())
-                                };
-
-                                match result {
-                                    SendBundleResult::Success { tx_hash, block_number, .. } => {
-                                        Ok(ServerResponse::DebugSendBundleNow { hash: tx_hash, block_number })
+                                match self.bundle_sender_actions[0]
+                                    .send(BundleSenderAction::SendBundle(SendBundleRequest {
+                                        responder: tx,
+                                    }))
+                                    .await
+                                {
+                                    Err(e) => Err(anyhow::anyhow!(
+                                        "failed to send send bundle request: {}",
+                                        e.to_string()
+                                    )
+                                    .into()),
+                                    Ok(()) => match rx.await {
+                                        Err(e) => Err(anyhow::anyhow!(
+                                            "failed to receive bundle result: {e:?}"
+                                        )
+                                        .into()),
+                                        Ok(SendBundleResult::Success {
+                                            tx_hash,
+                                            block_number,
+                                            ..
+                                        }) => Ok(ServerResponse::DebugSendBundleNow {
+                                            hash: tx_hash,
+                                            block_number,
+                                        }),
+                                        Ok(SendBundleResult::NoOperationsInitially) => {
+                                            Err(BuilderError::NoOperationsToSend)
+                                        }
+                                        Ok(SendBundleResult::Error(e)) => {
+                                            Err(anyhow::anyhow!("send bundle error: {e:?}").into())
+                                        }
                                     },
-                                    SendBundleResult::NoOperationsInitially => {
-                                        Err(BuilderError::NoOperationsToSend)
-                                    },
-                                    SendBundleResult::Error(e) => Err(anyhow::anyhow!("send bundle error: {e:?}").into()),
                                 }
-                            },
-                            ServerRequestKind::DebugSetBundlingMode { mode } => {
-                                if self.bundle_sender_actions.len() != 1 {
-                                    break 'a Err(anyhow::anyhow!("more than 1 bundle builder not supported in debug mode").into())
-                                }
+                            }
+                        }
 
-                                match self.bundle_sender_actions[0].send(BundleSenderAction::ChangeMode(mode)).await {
-                                    Ok(()) => {},
-                                    Err(e) => break 'a Err(anyhow::anyhow!("failed to change bundler mode: {}", e.to_string()).into())
+                        ServerRequestKind::DebugSetBundlingMode { mode } => {
+                            if self.bundle_sender_actions.len() != 1 {
+                                Err(anyhow::anyhow!(
+                                    "more than 1 bundle builder not supported in debug mode"
+                                )
+                                .into())
+                            } else {
+                                match self.bundle_sender_actions[0]
+                                    .send(BundleSenderAction::ChangeMode(mode))
+                                    .await
+                                {
+                                    Ok(()) => Ok(ServerResponse::DebugSetBundlingMode),
+                                    Err(e) => Err(anyhow::anyhow!(
+                                        "failed to change bundler mode: {}",
+                                        e.to_string()
+                                    )
+                                    .into()),
                                 }
-
-                                Ok(ServerResponse::DebugSetBundlingMode)
-                            },
+                            }
                         }
                     };
 
@@ -296,6 +347,8 @@ enum ServerRequestKind {
     GetSupportedEntryPoints,
     DebugSendBundleNow,
     DebugSetBundlingMode { mode: BundlingMode },
+    SendSponsoredDelegation { auth: Eip7702Auth },
+    GetDelegationStatus { id: DelegationId },
 }
 
 #[derive(Debug)]
@@ -309,4 +362,6 @@ enum ServerResponse {
     GetSupportedEntryPoints { entry_points: Vec<Address> },
     DebugSendBundleNow { hash: B256, block_number: u64 },
     DebugSetBundlingMode,
+    SendSponsoredDelegation { id: DelegationId },
+    GetDelegationStatus { status: DelegationStatus },
 }

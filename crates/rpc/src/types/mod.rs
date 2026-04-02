@@ -415,3 +415,18 @@ pub struct RpcUserOperationGasPrice {
     /// Suggested fees with buffer for faster inclusion
     pub suggested: RpcSuggestedGasFees,
 }
+
+/// Current status of a sponsored delegation request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "status")]
+pub enum RpcDelegationStatus {
+    /// Delegation has been submitted but not yet mined.
+    Pending,
+    /// Delegation has been mined.
+    Mined {
+        /// Hash of the mined transaction.
+        tx_hash: B256,
+    },
+    /// Delegation status is unknown.
+    Unknown,
+}

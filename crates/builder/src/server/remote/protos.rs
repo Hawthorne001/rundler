@@ -11,8 +11,10 @@
 // You should have received a copy of the GNU General Public License along with Rundler.
 // If not, see https://www.gnu.org/licenses/.
 
-use rundler_task::grpc::protos::ConversionError;
-use rundler_types::builder::BundlingMode as RpcBundlingMode;
+use alloy_eips::eip7702::{Authorization, SignedAuthorization};
+use alloy_primitives::U256;
+use rundler_task::grpc::protos::{ConversionError, ToProtoBytes, from_bytes};
+use rundler_types::{authorization::Eip7702Auth, builder::BundlingMode as RpcBundlingMode};
 
 tonic::include_proto!("builder");
 
@@ -24,6 +26,40 @@ impl From<RpcBundlingMode> for BundlingMode {
         match mode {
             RpcBundlingMode::Auto => Self::Auto,
             RpcBundlingMode::Manual => Self::Manual,
+        }
+    }
+}
+
+impl TryFrom<AuthorizationTuple> for Eip7702Auth {
+    type Error = ConversionError;
+
+    fn try_from(value: AuthorizationTuple) -> Result<Self, Self::Error> {
+        if value.y_parity > 1 {
+            return Err(ConversionError::InvalidEnumValue(value.y_parity as i32));
+        }
+        Ok(SignedAuthorization::new_unchecked(
+            Authorization {
+                chain_id: U256::from(value.chain_id),
+                address: from_bytes(&value.address)?,
+                nonce: value.nonce,
+            },
+            value.y_parity as u8,
+            from_bytes(&value.r)?,
+            from_bytes(&value.s)?,
+        )
+        .into())
+    }
+}
+
+impl From<Eip7702Auth> for AuthorizationTuple {
+    fn from(value: Eip7702Auth) -> Self {
+        AuthorizationTuple {
+            chain_id: value.chain_id.try_into().unwrap_or(u64::MAX),
+            address: value.address.to_proto_bytes(),
+            nonce: value.nonce,
+            y_parity: value.y_parity().into(),
+            r: value.r().to_proto_bytes(),
+            s: value.s().to_proto_bytes(),
         }
     }
 }

@@ -37,6 +37,11 @@ service Builder {
     // Sets bundling mode. After setting mode to “manual”, an explicit call to
     // debug_bundler_sendBundleNow is required to send a bundle.
     rpc DebugSetBundlingMode(DebugSetBundlingModeRequest) returns (DebugSetBundlingModeResponse);
+    // Submits a bundler-sponsored EIP-7702 delegation transaction on behalf of a user.
+    // Returns a delegation ID immediately; poll GetDelegationStatus for the result.
+    rpc SendSponsoredDelegation(SendSponsoredDelegationRequest) returns (SendSponsoredDelegationResponse);
+    // Returns the current status of a previously submitted sponsored delegation.
+    rpc GetDelegationStatus(GetDelegationStatusRequest) returns (GetDelegationStatusResponse);
 }
 
 message GetSupportedEntryPointsRequest {}
@@ -78,3 +83,54 @@ message BuilderError {
 }
 
 message NoOperationsToSendError {}
+
+// EIP-7702 signed authorization tuple
+message AuthorizationTuple {
+    uint64 chain_id = 1;
+    uint64 nonce = 2;
+    bytes address = 3;
+    uint32 y_parity = 4;
+    bytes r = 5;
+    bytes s = 6;
+}
+
+message SendSponsoredDelegationRequest {
+    AuthorizationTuple auth = 1;
+}
+
+message SendSponsoredDelegationResponse {
+    oneof result {
+        SendSponsoredDelegationSuccess success = 1;
+        BuilderError failure = 2;
+    }
+}
+
+message SendSponsoredDelegationSuccess {
+    // Opaque delegation ID formatted as "{chain_id}:{eoa}:{nonce}:{address}".
+    // Use GetDelegationStatus to poll for the mined transaction hash.
+    string delegation_id = 1;
+}
+
+message GetDelegationStatusRequest {
+    string delegation_id = 1;
+}
+
+message GetDelegationStatusResponse {
+    oneof result {
+        GetDelegationStatusSuccess success = 1;
+        BuilderError failure = 2;
+    }
+}
+
+enum DelegationStatusKind {
+    DELEGATION_STATUS_KIND_UNSPECIFIED = 0;
+    DELEGATION_STATUS_KIND_PENDING = 1;
+    DELEGATION_STATUS_KIND_MINED = 2;
+    DELEGATION_STATUS_KIND_UNKNOWN = 3;
+}
+
+message GetDelegationStatusSuccess {
+    DelegationStatusKind status = 1;
+    // Set when status is DELEGATION_STATUS_MINED.
+    optional bytes tx_hash = 2;
+}

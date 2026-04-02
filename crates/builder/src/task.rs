@@ -20,6 +20,7 @@ use std::{
 
 use alloy_primitives::{Address, B256};
 use anyhow::Context;
+use futures_util::StreamExt;
 use rundler_provider::{
     AlloyNetworkConfig, FeeEstimator, Providers as ProvidersT, ProvidersWithEntryPointT,
 };
@@ -30,7 +31,9 @@ use rundler_sim::{
 };
 use rundler_task::TaskSpawnerExt;
 use rundler_types::{
-    EntryPointAbiVersion, EntryPointVersion, chain::ChainSpec, pool::Pool as PoolT,
+    EntryPointAbiVersion, EntryPointVersion,
+    chain::ChainSpec,
+    pool::{NewHead, Pool as PoolT},
     proxy::SubmissionProxy,
 };
 use rundler_utils::emit::WithEntryPoint;
@@ -42,6 +45,7 @@ use crate::{
     assigner::{Assigner, EntrypointInfo},
     bundle_proposer::{self, BundleProposerImpl, BundleProposerProviders, BundleProposerT},
     bundle_sender::{self, BundleSender, BundleSenderAction, BundleSenderImpl},
+    delegation_sender::{DelegationSenderTask, Settings as DelegationSettings},
     emit::BuilderEvent,
     sender::TransactionSenderArgs,
     server::{self, LocalBuilderBuilder},
@@ -279,7 +283,7 @@ where
             self.args.entry_points.iter().map(|ep| ep.address).collect();
 
         // Create one bundle sender per signer - each handles all entrypoints via the registry
-        let actions = self
+        let (actions, heads_tx) = self
             .create_builders(
                 &task_spawner,
                 &self.signer_manager,
@@ -291,11 +295,32 @@ where
 
         let builder_handle = self.builder_builder.get_handle();
 
+        let (delegation_task, delegation_handle) = DelegationSenderTask::new(
+            self.signer_manager.clone(),
+            self.providers.evm().clone(),
+            self.providers.fee_estimator().clone(),
+            DelegationSettings {
+                max_blocks_to_wait_for_mine: self.args.max_blocks_to_wait_for_mine,
+                max_fee_bumps: self.args.max_cancellation_fee_increases,
+                fee_bump_percent: self.args.replacement_fee_percent_increase,
+                max_delegation_gas: self.args.max_bundle_gas as u64,
+            },
+            heads_tx.clone(),
+        );
+        task_spawner
+            .spawn_critical_with_graceful_shutdown_signal("delegation sender", |shutdown| {
+                delegation_task.run(shutdown)
+            });
         task_spawner.spawn_critical_with_graceful_shutdown_signal(
             "local builder server",
             |shutdown| {
-                self.builder_builder
-                    .run(bundle_sender_actions, supported_entry_points, shutdown)
+                self.builder_builder.run(
+                    bundle_sender_actions,
+                    supported_entry_points,
+                    heads_tx.subscribe(),
+                    delegation_handle,
+                    shutdown,
+                )
             },
         );
 
@@ -428,24 +453,55 @@ where
         signer_manager: &Arc<dyn SignerManager>,
         assigner: Arc<Assigner>,
         proposers: Arc<HashMap<ProposerKey, Box<dyn BundleProposerT>>>,
-    ) -> anyhow::Result<Vec<mpsc::Sender<BundleSenderAction>>>
+    ) -> anyhow::Result<(
+        Vec<mpsc::Sender<BundleSenderAction>>,
+        broadcast::Sender<Arc<NewHead>>,
+    )>
     where
         T: TaskSpawnerExt,
     {
-        let mut bundle_sender_actions = vec![];
+        // One pool subscription covers all signer addresses. A single broadcast channel
+        // fans out new-head events to every bundle sender, keeping pool-side work O(N)
+        // instead of O(N²) (one subscription per sender × N addresses each).
+        let all_signer_addresses = signer_manager.addresses();
+        let shared_heads = self
+            .pool
+            .subscribe_new_heads(all_signer_addresses)
+            .await
+            .context("failed to subscribe to new heads for bundle senders")?;
 
-        for _ in 0..self.args.num_signers {
+        let (heads_tx, _) = broadcast::channel::<Arc<NewHead>>(16);
+        let heads_tx_fwd = heads_tx.clone();
+        task_spawner.spawn_critical(
+            "new-heads-fanout",
+            Box::pin(async move {
+                let mut stream = shared_heads;
+                while let Some(head) = stream.next().await {
+                    tracing::debug!("new-heads-fanout: block {}", head.block_number);
+                    if heads_tx_fwd.send(Arc::new(head)).is_err() {
+                        // All receivers dropped — senders have shut down.
+                        break;
+                    }
+                }
+                tracing::error!("shared new-heads stream closed (shutdown)");
+            }),
+        );
+
+        let mut bundle_sender_actions = vec![];
+        for i in 0..self.args.num_signers {
             let bundle_sender_action = self
                 .create_bundle_builder(
                     task_spawner,
                     signer_manager,
                     assigner.clone(),
                     proposers.clone(),
+                    i as usize,
+                    heads_tx.subscribe(),
                 )
                 .await?;
             bundle_sender_actions.push(bundle_sender_action);
         }
-        Ok(bundle_sender_actions)
+        Ok((bundle_sender_actions, heads_tx))
     }
 
     async fn create_bundle_builder<T>(
@@ -454,17 +510,13 @@ where
         signer_manager: &Arc<dyn SignerManager>,
         assigner: Arc<Assigner>,
         proposers: Arc<HashMap<ProposerKey, Box<dyn BundleProposerT>>>,
+        index: usize,
+        heads_rx: broadcast::Receiver<Arc<NewHead>>,
     ) -> anyhow::Result<mpsc::Sender<BundleSenderAction>>
     where
         T: TaskSpawnerExt,
     {
         let (send_bundle_tx, send_bundle_rx) = mpsc::channel(1);
-
-        let Some(signer) = signer_manager.lease_signer() else {
-            return Err(anyhow::anyhow!("No signer available"));
-        };
-
-        let sender_eoa = signer.address();
 
         let transaction_sender = self
             .args
@@ -476,17 +528,16 @@ where
             replacement_fee_percent_increase: self.args.replacement_fee_percent_increase,
         };
 
-        // Builder tag now uses just the sender address since workers handle all entrypoints
-        let builder_tag = format!("0x{sender_eoa:x}");
+        // Tag identifies this sender slot by index since the signing address is dynamic.
+        let builder_tag = format!("sender_{index}");
 
         let transaction_tracker = TransactionTrackerImpl::new(
             self.providers.evm().clone(),
             transaction_sender,
-            signer,
+            signer_manager.clone(),
             tracker_settings,
             builder_tag.clone(),
-        )
-        .await?;
+        );
 
         let sender_settings = bundle_sender::Settings {
             max_replacement_underpriced_blocks: self.args.max_replacement_underpriced_blocks,
@@ -500,7 +551,7 @@ where
             builder_tag,
             send_bundle_rx,
             self.args.chain_spec.clone(),
-            sender_eoa,
+            heads_rx,
             transaction_tracker,
             fee_estimator,
             assigner,

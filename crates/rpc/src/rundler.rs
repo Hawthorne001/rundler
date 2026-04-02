@@ -11,6 +11,8 @@
 // You should have received a copy of the GNU General Public License along with Rundler.
 // If not, see https://www.gnu.org/licenses/.
 
+use std::sync::Arc;
+
 use alloy_primitives::{Address, B256, U64, U128, U256};
 use anyhow::Context;
 use async_trait::async_trait;
@@ -18,15 +20,19 @@ use futures_util::future;
 use jsonrpsee::{core::RpcResult, proc_macros::rpc};
 use rundler_provider::{EvmProvider, FeeEstimator};
 use rundler_types::{
-    GasFees, UserOperation, UserOperationId, UserOperationVariant, chain::ChainSpec, pool::Pool,
+    GasFees, UserOperation, UserOperationId, UserOperationVariant,
+    authorization::Eip7702Auth,
+    builder::{Builder as BuilderT, DelegationStatus},
+    chain::ChainSpec,
+    pool::Pool,
 };
 use tracing::instrument;
 
 use crate::{
     eth::{EntryPointRouter, EthResult, EthRpcError},
     types::{
-        RpcMinedUserOperation, RpcSuggestedGasFees, RpcUserOperation, RpcUserOperationGasPrice,
-        RpcUserOperationStatus, UOStatusEnum, UserOperationStatusEnum,
+        RpcDelegationStatus, RpcMinedUserOperation, RpcSuggestedGasFees, RpcUserOperation,
+        RpcUserOperationGasPrice, RpcUserOperationStatus, UOStatusEnum, UserOperationStatusEnum,
     },
     utils::{self, TryIntoRundlerType},
 };
@@ -94,6 +100,18 @@ pub trait RundlerApi {
     /// Returns suggested gas prices for user operations
     #[method(name = "getUserOperationGasPrice")]
     async fn get_user_operation_gas_price(&self) -> RpcResult<RpcUserOperationGasPrice>;
+
+    /// Sponsor an EIP-7702 delegation on behalf of the caller.
+    ///
+    /// The bundler pays the gas cost and immediately returns a delegation ID.
+    /// Poll `rundler_delegationStatus` with the returned ID to get the transaction hash.
+    /// To undelegate, set `address` to the zero address.
+    #[method(name = "sendSponsoredDelegation")]
+    async fn send_sponsored_delegation(&self, auth: Eip7702Auth) -> RpcResult<B256>;
+
+    /// Returns the status of a previously submitted sponsored delegation.
+    #[method(name = "delegationStatus")]
+    async fn delegation_status(&self, delegation_id: B256) -> RpcResult<RpcDelegationStatus>;
 }
 
 pub(crate) struct RundlerApi<P, F, E> {
@@ -102,6 +120,7 @@ pub(crate) struct RundlerApi<P, F, E> {
     pool_server: P,
     entry_point_router: EntryPointRouter,
     evm_provider: E,
+    builder: Arc<dyn BuilderT>,
     settings: RundlerApiSettings,
 }
 
@@ -181,6 +200,24 @@ where
         )
         .await
     }
+
+    #[instrument(skip_all, fields(rpc_method = "rundler_sendSponsoredDelegation"))]
+    async fn send_sponsored_delegation(&self, auth: Eip7702Auth) -> RpcResult<B256> {
+        utils::safe_call_rpc_handler(
+            "rundler_sendSponsoredDelegation",
+            RundlerApi::send_sponsored_delegation(self, auth),
+        )
+        .await
+    }
+
+    #[instrument(skip_all, fields(rpc_method = "rundler_delegationStatus"))]
+    async fn delegation_status(&self, delegation_id: B256) -> RpcResult<RpcDelegationStatus> {
+        utils::safe_call_rpc_handler(
+            "rundler_delegationStatus",
+            RundlerApi::delegation_status(self, delegation_id),
+        )
+        .await
+    }
 }
 
 impl<P, F, E> RundlerApi<P, F, E>
@@ -195,6 +232,7 @@ where
         pool_server: P,
         fee_estimator: F,
         evm_provider: E,
+        builder: Arc<dyn BuilderT>,
         settings: RundlerApiSettings,
     ) -> Self {
         Self {
@@ -203,6 +241,7 @@ where
             pool_server,
             fee_estimator,
             evm_provider,
+            builder,
             settings,
         }
     }
@@ -402,6 +441,46 @@ where
             .map_err(EthRpcError::from)?;
 
         Ok(uo.map(|uo| uo.uo.into()))
+    }
+
+    async fn send_sponsored_delegation(&self, auth: Eip7702Auth) -> EthResult<B256> {
+        // Validate: chain ID must match.
+        let expected_chain_id = U256::from(self.chain_spec.id);
+        if auth.chain_id != expected_chain_id {
+            Err(EthRpcError::InvalidParams(format!(
+                "authorization chain_id {} does not match expected {}",
+                auth.chain_id, expected_chain_id
+            )))?;
+        }
+
+        // Validate: signature must be recoverable.
+        auth.recover_authority().map_err(|e| {
+            EthRpcError::InvalidParams(format!("invalid authorization signature: {e}"))
+        })?;
+
+        let id = self
+            .builder
+            .send_sponsored_delegation(auth)
+            .await
+            .map_err(|e| anyhow::anyhow!("builder error: {e:?}"))?;
+
+        Ok(id.into())
+    }
+
+    async fn delegation_status(&self, delegation_id: B256) -> EthResult<RpcDelegationStatus> {
+        let id = delegation_id.into();
+
+        let status = self
+            .builder
+            .get_delegation_status(id)
+            .await
+            .map_err(|e| anyhow::anyhow!("builder error: {e:?}"))?;
+
+        Ok(match status {
+            DelegationStatus::Pending => RpcDelegationStatus::Pending,
+            DelegationStatus::Mined { tx_hash } => RpcDelegationStatus::Mined { tx_hash },
+            DelegationStatus::Unknown => RpcDelegationStatus::Unknown,
+        })
     }
 
     #[instrument(skip_all)]
