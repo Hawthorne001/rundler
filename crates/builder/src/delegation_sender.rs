@@ -14,6 +14,7 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use alloy_network::TransactionBuilder7702;
@@ -64,6 +65,9 @@ pub(crate) enum DelegationSenderAction {
     /// use [`DelegationSenderAction::GetStatus`] to poll for the mined tx hash.
     Send {
         auth: Eip7702Auth,
+        /// Unix timestamp (seconds) after which the delegation is dropped unsubmitted.
+        /// `None` means no expiry.
+        valid_until: Option<u64>,
         responder: oneshot::Sender<DelegationId>,
     },
     /// Query the current status of a previously submitted delegation.
@@ -82,11 +86,16 @@ pub struct DelegationSenderHandle {
 }
 
 impl DelegationSenderHandle {
-    pub(crate) async fn send_delegation(&self, auth: Eip7702Auth) -> BuilderResult<DelegationId> {
+    pub(crate) async fn send_delegation(
+        &self,
+        auth: Eip7702Auth,
+        valid_until: Option<u64>,
+    ) -> BuilderResult<DelegationId> {
         let (tx, rx) = oneshot::channel();
         self.action_tx
             .send(DelegationSenderAction::Send {
                 auth,
+                valid_until,
                 responder: tx,
             })
             .await
@@ -131,8 +140,9 @@ pub(crate) struct DelegationSenderTask<E, F> {
     action_rx: mpsc::Receiver<DelegationSenderAction>,
     completion_tx: mpsc::Sender<CompletionEvent>,
     completion_rx: mpsc::Receiver<CompletionEvent>,
-    /// Incoming delegations waiting for a free signer.
-    queue: VecDeque<(DelegationId, Eip7702Auth)>,
+    /// Incoming delegations waiting for a free signer. Third element is the optional
+    /// expiry deadline (Unix timestamp in seconds).
+    queue: VecDeque<(DelegationId, Eip7702Auth, Option<u64>)>,
     /// Delegations that have been submitted and are waiting to mine.
     pending: HashSet<DelegationId>,
     /// Delegations that have mined, with their (tx_hash, block_number).
@@ -146,6 +156,27 @@ pub(crate) struct DelegationSenderTask<E, F> {
     provider: E,
     fee_estimator: F,
     settings: Settings,
+}
+
+impl<E, F> DelegationSenderTask<E, F> {
+    /// Drop delegations whose `valid_until` deadline is strictly before `now`.
+    ///
+    /// Removed entries are also purged from `pending` so their status returns
+    /// `Unknown` rather than stale `Pending`.
+    fn drop_expired(&mut self, now: u64) {
+        let mut i = 0;
+        while i < self.queue.len() {
+            let (id, _, valid_until) = &self.queue[i];
+            if valid_until.is_some_and(|deadline| now > deadline) {
+                let id = id.clone();
+                warn!("dropping expired delegation {id}");
+                self.queue.remove(i);
+                self.pending.remove(&id);
+            } else {
+                i += 1;
+            }
+        }
+    }
 }
 
 impl<E, F> DelegationSenderTask<E, F>
@@ -187,6 +218,12 @@ where
     /// loop stops and the remaining entries stay in the queue for the next
     /// drain attempt (on the next block or the next `Send` action).
     fn try_drain_queue(&mut self) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.drop_expired(now);
+
         while !self.queue.is_empty() {
             let Some(signer) = self.signer_manager.lease_signer() else {
                 break;
@@ -199,9 +236,10 @@ where
                 .saturating_sub(DELEGATION_GAS_BUFFER))
                 / DELEGATION_GAS_PER_AUTH) as usize;
             let batch_size = self.queue.len().min(max_auths.max(1));
-            let batch: Vec<(DelegationId, Eip7702Auth)> = self.queue.drain(..batch_size).collect();
-            let ids: Vec<DelegationId> = batch.iter().map(|(id, _)| id.clone()).collect();
-            let auths: Vec<Eip7702Auth> = batch.into_iter().map(|(_, auth)| auth).collect();
+            let batch: Vec<(DelegationId, Eip7702Auth, Option<u64>)> =
+                self.queue.drain(..batch_size).collect();
+            let ids: Vec<DelegationId> = batch.iter().map(|(id, _, _)| id.clone()).collect();
+            let auths: Vec<Eip7702Auth> = batch.into_iter().map(|(_, auth, _)| auth).collect();
 
             tracing::debug!(
                 "delegation sender: draining batch of {} (queue remaining: {})",
@@ -264,11 +302,11 @@ where
 
                 Some(action) = self.action_rx.recv() => {
                     match action {
-                        DelegationSenderAction::Send { auth, responder } => {
+                        DelegationSenderAction::Send { auth, valid_until, responder } => {
                             let id = DelegationId::from_auth(&auth);
                             self.pending.insert(id.clone());
                             let _ = responder.send(id.clone());
-                            self.queue.push_back((id, auth));
+                            self.queue.push_back((id, auth, valid_until));
                             self.try_drain_queue();
                         }
 
@@ -466,5 +504,149 @@ where
             self.provider.get_transaction_receipt(tx_hash).await,
             Ok(Some(_))
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloy_primitives::Address;
+    use rundler_types::authorization::Eip7702Auth;
+
+    use super::*;
+
+    // Minimal stand-in that holds only the state touched by `drop_expired`.
+    // Avoids the need for real/mock providers or signers.
+    struct StubTask {
+        queue: VecDeque<(DelegationId, Eip7702Auth, Option<u64>)>,
+        pending: HashSet<DelegationId>,
+    }
+
+    impl StubTask {
+        fn new() -> Self {
+            Self {
+                queue: VecDeque::new(),
+                pending: HashSet::new(),
+            }
+        }
+
+        fn drop_expired(&mut self, now: u64) {
+            let mut i = 0;
+            while i < self.queue.len() {
+                let (id, _, valid_until) = &self.queue[i];
+                if valid_until.is_some_and(|deadline| now > deadline) {
+                    let id = id.clone();
+                    self.queue.remove(i);
+                    self.pending.remove(&id);
+                } else {
+                    i += 1;
+                }
+            }
+        }
+    }
+
+    fn make_auth(seed: u8) -> Eip7702Auth {
+        Eip7702Auth::new_dummy(1, Address::with_last_byte(seed))
+    }
+
+    #[test]
+    fn expired_delegation_removed_from_queue_and_pending() {
+        let mut task = StubTask::new();
+        let auth = make_auth(1);
+        let id = DelegationId::from_auth(&auth);
+
+        task.queue.push_back((id.clone(), auth, Some(100)));
+        task.pending.insert(id.clone());
+
+        task.drop_expired(200);
+
+        assert!(
+            task.queue.is_empty(),
+            "expired entry should be removed from queue"
+        );
+        assert!(
+            !task.pending.contains(&id),
+            "expired entry should be removed from pending"
+        );
+    }
+
+    #[test]
+    fn non_expired_delegation_stays_in_queue() {
+        let mut task = StubTask::new();
+        let auth = make_auth(2);
+        let id = DelegationId::from_auth(&auth);
+
+        task.queue
+            .push_back((id.clone(), auth, Some(1_000_000_000_000)));
+        task.pending.insert(id.clone());
+
+        task.drop_expired(200);
+
+        assert_eq!(task.queue.len(), 1, "non-expired entry should remain");
+        assert!(task.pending.contains(&id));
+    }
+
+    #[test]
+    fn no_expiry_delegation_is_never_dropped() {
+        let mut task = StubTask::new();
+        let auth = make_auth(3);
+        let id = DelegationId::from_auth(&auth);
+
+        task.queue.push_back((id.clone(), auth, None));
+        task.pending.insert(id.clone());
+
+        task.drop_expired(u64::MAX);
+
+        assert_eq!(
+            task.queue.len(),
+            1,
+            "entry with no expiry should never be dropped"
+        );
+        assert!(task.pending.contains(&id));
+    }
+
+    #[test]
+    fn only_expired_delegations_removed_from_mixed_queue() {
+        let mut task = StubTask::new();
+
+        let auth_exp1 = make_auth(1);
+        let id_exp1 = DelegationId::from_auth(&auth_exp1);
+        let auth_ok = make_auth(2);
+        let id_ok = DelegationId::from_auth(&auth_ok);
+        let auth_exp2 = make_auth(3);
+        let id_exp2 = DelegationId::from_auth(&auth_exp2);
+        let auth_none = make_auth(4);
+        let id_none = DelegationId::from_auth(&auth_none);
+
+        task.queue.push_back((id_exp1.clone(), auth_exp1, Some(50)));
+        task.queue.push_back((id_ok.clone(), auth_ok, Some(500)));
+        task.queue.push_back((id_exp2.clone(), auth_exp2, Some(99)));
+        task.queue.push_back((id_none.clone(), auth_none, None));
+        for id in [&id_exp1, &id_ok, &id_exp2, &id_none] {
+            task.pending.insert(id.clone());
+        }
+
+        task.drop_expired(100);
+
+        assert_eq!(task.queue.len(), 2, "two non-expired entries should remain");
+        assert!(!task.pending.contains(&id_exp1));
+        assert!(!task.pending.contains(&id_exp2));
+        assert!(task.pending.contains(&id_ok));
+        assert!(task.pending.contains(&id_none));
+    }
+
+    #[test]
+    fn deadline_equal_to_now_is_not_expired() {
+        let mut task = StubTask::new();
+        let auth = make_auth(5);
+        let id = DelegationId::from_auth(&auth);
+
+        task.queue.push_back((id.clone(), auth, Some(100)));
+        task.pending.insert(id.clone());
+
+        // condition is `now > deadline`, so now == deadline should NOT expire
+        task.drop_expired(100);
+
+        assert_eq!(task.queue.len(), 1, "deadline == now should not expire");
+        assert!(task.pending.contains(&id));
     }
 }
