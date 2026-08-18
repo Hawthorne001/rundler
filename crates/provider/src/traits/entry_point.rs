@@ -54,6 +54,8 @@ pub enum HandleOpsOut {
     PostOpRevert,
     /// Call reverted
     Revert(Bytes),
+    /// Call rejected before execution because the fee caps were below the base fee
+    Underpriced,
 }
 
 /// Deposit info for an address from the entry point contract

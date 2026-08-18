@@ -132,6 +132,9 @@ pub struct ChainSpec {
     /// This parameter is used to trigger the builder to send a bundle after a specified
     /// amount of time, before a new block is not received.
     pub bundle_max_send_interval_millis: u64,
+    /// True if the bundle validation `eth_call` should be sent without
+    /// `maxFeePerGas`/`maxPriorityFeePerGas` fee caps.
+    pub bundle_simulation_omit_gas_fees: bool,
 
     /*
      * Senders
@@ -215,6 +218,7 @@ impl Default for ChainSpec {
             charge_gas_limit_via_pvg: false,
             max_transaction_size_bytes: 131072, // 128 KiB
             bundle_max_send_interval_millis: 1000,
+            bundle_simulation_omit_gas_fees: false,
             flashbots_enabled: false,
             flashbots_relay_url: None,
             bloxroute_enabled: false,
