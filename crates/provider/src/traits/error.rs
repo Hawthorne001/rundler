@@ -12,9 +12,10 @@
 // If not, see https://www.gnu.org/licenses/.
 
 use alloy_contract::Error as ContractError;
+use alloy_json_rpc::RpcError;
 use alloy_primitives::Bytes;
 use alloy_sol_types::SolError;
-use alloy_transport::TransportError;
+use alloy_transport::{TransportError, TransportErrorKind};
 
 /// Error enumeration for the Provider trait
 #[derive(Debug, thiserror::Error)]
@@ -62,6 +63,24 @@ impl ProviderError {
                 TransportError::ErrorResp(e),
             )) => e.as_decoded_error(),
             _ => None,
+        }
+    }
+
+    /// Returns true when the endpoint reported that it is rate limiting us.
+    ///
+    /// Every check is alloy's, so the provider-specific codes stay in one place.
+    /// Delegated per variant rather than via `TransportErrorKind::is_retry_err`
+    /// for the whole enum, which is broader than a rate limit: it also retries
+    /// `MissingBatchResponse` and HTTP 503, and 503 is provider-health evidence.
+    pub fn is_rate_limited(&self) -> bool {
+        let ProviderError::RPC(error) = self else {
+            return false;
+        };
+        match error {
+            RpcError::Transport(TransportErrorKind::HttpError(http)) => http.is_rate_limit_err(),
+            RpcError::Transport(kind @ TransportErrorKind::Custom(_)) => kind.is_retry_err(),
+            RpcError::ErrorResp(resp) => resp.is_retry_err(),
+            _ => false,
         }
     }
 }

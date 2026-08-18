@@ -95,6 +95,12 @@ pub(crate) enum TxSenderError {
         /// RPC error message.
         message: String,
     },
+    /// The submission endpoint is rate limiting us.
+    ///
+    /// The transaction was never judged, so this says nothing about the bundle.
+    /// Handled by backing the builder off the endpoint.
+    #[error("submission endpoint rate limited: {0}")]
+    RateLimited(anyhow::Error),
     /// Sender is unavailable due to an outage or transport error.
     ///
     /// When a fallback sender is configured this triggers failover.
@@ -149,7 +155,10 @@ impl TxSenderError {
             TxSenderError::SenderUnavailable(_) | TxSenderError::UnrecognizedRpc { .. } => {
                 RpcOutcomeClass::NonTerminal
             }
-            TxSenderError::Underpriced
+            // A rate limit is evidence about our request volume, not about the
+            // bundle: the endpoint never judged the transaction.
+            TxSenderError::RateLimited(_)
+            | TxSenderError::Underpriced
             | TxSenderError::ReplacementUnderpriced
             | TxSenderError::NonceTooLow
             | TxSenderError::ConditionNotMet
@@ -416,6 +425,9 @@ fn create_hard_cancel_tx(to: Address, nonce: u64, gas_fees: GasFees) -> Transact
 
 impl From<ProviderError> for TxSenderError {
     fn from(value: ProviderError) -> Self {
+        if value.is_rate_limited() {
+            return TxSenderError::RateLimited(anyhow::anyhow!("{value}"));
+        }
         match &value {
             ProviderError::RPC(e) => {
                 if let Some(e) = e.as_error_resp() {
@@ -465,6 +477,7 @@ impl From<TransactionSubmissionError> for TxSenderError {
 
 #[cfg(test)]
 mod tests {
+    use alloy_json_rpc::Id;
     use alloy_transport::TransportErrorKind;
     use rundler_provider::ProviderError;
     use rundler_types::chain::ChainSpec;
@@ -499,6 +512,12 @@ mod tests {
                 TxSenderError::Other(anyhow::anyhow!("signing failed")),
                 RpcOutcomeClass::Neutral,
             ),
+            // A rate limit must not reach poison user operation handling: it is
+            // evidence about our request volume, not about the bundle.
+            (
+                TxSenderError::RateLimited(anyhow::anyhow!("HTTP error 429")),
+                RpcOutcomeClass::Neutral,
+            ),
         ];
 
         for (error, expected) in cases {
@@ -523,6 +542,57 @@ mod tests {
         )));
 
         assert!(matches!(error, TxSenderError::SenderUnavailable(_)));
+    }
+
+    #[test]
+    fn maps_rate_limits_to_rate_limited() {
+        // HTTP 429, the shape a public sequencer endpoint returns.
+        let http_429 = TxSenderError::from(ProviderError::RPC(TransportErrorKind::http_error(
+            429,
+            "Too Many Requests".to_string(),
+        )));
+        assert!(matches!(http_429, TxSenderError::RateLimited(_)));
+
+        // A JSON-RPC error response, which would otherwise be classified as an
+        // ambiguous `UnrecognizedRpc` judgement of the transaction.
+        let rpc_429 = TxSenderError::from(super::rpc_error_response(429, "rate limit exceeded"));
+        assert!(matches!(rpc_429, TxSenderError::RateLimited(_)));
+
+        let rpc_limit_exceeded =
+            TxSenderError::from(super::rpc_error_response(-32005, "limit exceeded"));
+        assert!(matches!(rpc_limit_exceeded, TxSenderError::RateLimited(_)));
+
+        // A transport that lost the status code and left it in the text.
+        let stringified = TxSenderError::from(ProviderError::RPC(TransportErrorKind::custom_str(
+            "server returned 429 Too Many Requests",
+        )));
+        assert!(matches!(stringified, TxSenderError::RateLimited(_)));
+    }
+
+    #[test]
+    fn does_not_treat_service_unavailable_as_rate_limited() {
+        // 503 is provider-health evidence, and alloy groups it with rate limits
+        // as "retryable", so it must be excluded explicitly.
+        let error = TxSenderError::from(ProviderError::RPC(TransportErrorKind::http_error(
+            503,
+            "Service Unavailable".to_string(),
+        )));
+
+        assert!(matches!(error, TxSenderError::SenderUnavailable(_)));
+        assert_eq!(error.classify(), RpcOutcomeClass::NonTerminal);
+    }
+
+    #[test]
+    fn does_not_treat_missing_batch_response_as_rate_limited() {
+        // The other reason `is_rate_limited` delegates to
+        // `TransportErrorKind::is_retry_err` per variant instead of for the whole
+        // enum: alloy retries this too, but it is not a rate limit.
+        let error = TxSenderError::from(ProviderError::RPC(
+            TransportErrorKind::missing_batch_response(Id::Number(1)),
+        ));
+
+        assert!(matches!(error, TxSenderError::SenderUnavailable(_)));
+        assert_eq!(error.classify(), RpcOutcomeClass::NonTerminal);
     }
 
     #[test]
